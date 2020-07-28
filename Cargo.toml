@@ -7,8 +7,8 @@ license = "GPL-2.0+"
 documentation = "https://kchmck.github.io/doc/rtlsdr_mt/rtlsdr_mt/"
 repository = "https://github.com/kchmck/rtlsdr_mt.rs"
 keywords = ["rtl-sdr", "rtlsdr", "librtlsdr", "threading", "multithreading"]
+edition = "2018"
 
 [dependencies]
 
-libc = "0.2.8"
 rtlsdr_sys = "1.1.0"

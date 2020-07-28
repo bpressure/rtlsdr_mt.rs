@@ -28,33 +28,64 @@
 //! }).unwrap();
 //! ```
 
-extern crate libc;
-extern crate rtlsdr_sys as ffi;
+mod error;
+
+use error::*;
+use rtlsdr_sys as ffi;
 
 use std::ffi::CStr;
 use std::sync::Arc;
 
-use libc::{c_uchar, c_void};
+use std::os::raw::{c_void, c_uchar, c_char};
 
 /// Holds a list of valid gain values.
 pub type TunerGains = [i32; 32];
 
-/// Error type for this crate.
-pub type Error = ();
-
 /// Result type for this crate.
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, RtlSdrError>;
+
+pub struct DeviceInfo {
+    pub id: u32,
+    pub name: String,
+    pub manufacture: String,
+    pub product: String,
+    pub serial: String,
+}
+
+pub fn device_count() -> u32 {
+    unsafe { ffi::rtlsdr_get_device_count() }
+}
 
 /// Create an iterator over available RTL-SDR devices.
 ///
 /// The iterator yields device names in index order, so the device with the first yielded
 /// name can be opened at index 0, and so on.
-pub fn devices() -> impl Iterator<Item = &'static CStr> {
+pub fn devices() -> Result<Vec<DeviceInfo>> {
     let count = unsafe { ffi::rtlsdr_get_device_count() };
+    let mut v: Vec<DeviceInfo> = Vec::with_capacity(count as usize);
 
-    (0..count).map(|idx| unsafe {
-        CStr::from_ptr(ffi::rtlsdr_get_device_name(idx))
-    })
+    for idx in 0..count {
+        unsafe {
+            let name = from_pchar(ffi::rtlsdr_get_device_name(idx));
+
+            let m: [c_char; 256] = [0; 256];
+            let p: [c_char; 256] = [0; 256];
+            let s: [c_char; 256] = [0; 256];
+            check_err(ffi::rtlsdr_get_device_usb_strings(
+                idx,
+                m.as_ptr() as *mut c_char,
+                p.as_ptr() as *mut c_char,
+                s.as_ptr() as *mut c_char))?;
+            v.push(DeviceInfo {
+                id: idx,
+                name,
+                manufacture: from_pchar(m.as_ptr()),
+                product: from_pchar(p.as_ptr()),
+                serial: from_pchar(s.as_ptr()),
+            });
+        }
+    }
+    Ok(v)
 }
 
 /// Try to open the RTL-SDR device at the given index.
@@ -74,24 +105,20 @@ impl Device {
     fn open(idx: u32) -> Result<Self> {
         let mut dev = Device(std::ptr::null_mut());
 
-        if unsafe { ffi::rtlsdr_open(&mut dev.0, idx) } == 0 &&
-           unsafe { ffi::rtlsdr_reset_buffer(dev.0) } == 0
-        {
-            Ok(dev)
-        } else {
-            Err(())
-        }
+        check_err(unsafe { ffi::rtlsdr_open(&mut dev.0, idx) })?;
+        check_err(unsafe { ffi::rtlsdr_reset_buffer(dev.0) })?;
+        Ok(dev)
     }
 
     /// Close the device.
-    fn close(&self) {
-        unsafe { ffi::rtlsdr_close(self.0); }
+    fn close(&self) -> Result<()> {
+        check_err(unsafe { ffi::rtlsdr_close(self.0) })
     }
 }
 
 impl std::ops::Drop for Device {
     fn drop(&mut self) {
-        self.close();
+        self.close().unwrap();
     }
 }
 
@@ -116,11 +143,7 @@ impl Controller {
 
     /// Set the sample rate (megasamples/sec).
     pub fn set_sample_rate(&mut self, rate: u32) -> Result<()> {
-        if unsafe { ffi::rtlsdr_set_sample_rate(**self.0, rate) } == 0 {
-            Ok(())
-        } else {
-            Err(())
-        }
+        check_err(unsafe { ffi::rtlsdr_set_sample_rate(**self.0, rate) })
     }
 
     /// Get the current center frequency (Hz).
@@ -130,22 +153,14 @@ impl Controller {
 
     /// Set the center frequency (Hz).
     pub fn set_center_freq(&mut self, freq: u32) -> Result<()> {
-        if unsafe { ffi::rtlsdr_set_center_freq(**self.0, freq) } == 0 {
-            Ok(())
-        } else {
-            Err(())
-        }
+        check_err(unsafe { ffi::rtlsdr_set_center_freq(**self.0, freq) })
     }
 
     /// Set tuner bandwidth (Hz).
     ///
     /// Note that this is not bit DEPTH which is fixed at 8 in hardware.
     pub fn set_bandwidth(&mut self, bw: u32) -> Result<()> {
-        if unsafe { ffi::rtlsdr_set_tuner_bandwidth(**self.0, bw) } == 0 {
-            Ok(())
-        } else {
-            Err(())
-        }
+        check_err(unsafe { ffi::rtlsdr_set_tuner_bandwidth(**self.0, bw) })
     }
 
     /// Get the current frequency correction (ppm).
@@ -156,12 +171,9 @@ impl Controller {
     /// Set the frequency correction (ppm).
     pub fn set_ppm(&mut self, ppm: i32) -> Result<()> {
         let ret = unsafe { ffi::rtlsdr_set_freq_correction(**self.0, ppm) };
-
-        // librtlsdr returns -2 if the ppm is already set to the given value.
-        if ret == 0 || ret == -2 {
-            Ok(())
-        } else {
-            Err(())
+        match ret {
+            0 | -2 => Ok(()),
+            _ => Err(by_err_msg(ret))
         }
     }
 
@@ -169,26 +181,16 @@ impl Controller {
     ///
     /// Note that this also disables manual tuner gain.
     pub fn enable_agc(&mut self) -> Result<()> {
-        if unsafe { ffi::rtlsdr_set_tuner_gain_mode(**self.0, 0) } == 0 &&
-           unsafe { ffi::rtlsdr_set_agc_mode(**self.0, 1) } == 0
-        {
-            Ok(())
-        } else {
-            Err(())
-        }
+        check_err(unsafe { ffi::rtlsdr_set_tuner_gain_mode(**self.0, 0) })?;
+        check_err(unsafe { ffi::rtlsdr_set_agc_mode(**self.0, 1) })
     }
 
     /// Disable the hardware AGC.
     ///
     /// Note that this also enables manual tuner gain.
     pub fn disable_agc(&mut self) -> Result<()> {
-        if unsafe { ffi::rtlsdr_set_tuner_gain_mode(**self.0, 1) } == 0 &&
-           unsafe { ffi::rtlsdr_set_agc_mode(**self.0, 0) } == 0
-        {
-            Ok(())
-        } else {
-            Err(())
-        }
+        check_err(unsafe { ffi::rtlsdr_set_tuner_gain_mode(**self.0, 1) })?;
+        check_err(unsafe { ffi::rtlsdr_set_agc_mode(**self.0, 0) })
     }
 
     /// Get the list of valid tuner gain values.
@@ -214,13 +216,8 @@ impl Controller {
     ///
     /// Note that this also disables the hardware AGC.
     pub fn set_tuner_gain(&mut self, gain: i32) -> Result<()> {
-        if unsafe { ffi::rtlsdr_set_tuner_gain_mode(**self.0, 1) } == 0 &&
-           unsafe { ffi::rtlsdr_set_tuner_gain(**self.0, gain) } == 0
-        {
-            Ok(())
-        } else {
-            Err(())
-        }
+        check_err(unsafe { ffi::rtlsdr_set_tuner_gain_mode(**self.0, 1) })?;
+        check_err(unsafe { ffi::rtlsdr_set_tuner_gain(**self.0, gain) })
     }
 
     /// Cancel an asynchronous read if one is running.
@@ -251,15 +248,9 @@ impl Reader {
     {
         let ctx = &cb as *const _ as *mut c_void;
 
-        let ret = unsafe {
+        check_err(unsafe {
             ffi::rtlsdr_read_async(**self.0, async_wrapper::<F>, ctx, bufs, len)
-        };
-
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(())
-        }
+        })
     }
 }
 
@@ -272,3 +263,9 @@ extern fn async_wrapper<F>(buf: *mut c_uchar, len: u32, ctx: *mut c_void)
 }
 
 unsafe impl Send for Reader {}
+
+
+fn from_pchar(p: *const c_char) -> String {
+    let c_str = unsafe { CStr::from_ptr(p) };
+    String::from(std::str::from_utf8(c_str.to_bytes()).unwrap())
+}
