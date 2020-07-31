@@ -30,7 +30,7 @@
 
 mod error;
 
-use error::*;
+pub use error::*;
 use rtlsdr_sys as ffi;
 
 use std::ffi::CStr;
